@@ -1,4 +1,4 @@
-// dear imgui, v1.80
+// dear imgui, v1.81 WIP
 // (main code and documentation)
 
 // Help:
@@ -373,6 +373,9 @@ CODE
  When you are not sure about a old symbol or function name, try using the Search/Find function of your IDE to look for comments or references in all imgui files.
  You can read releases logs https://github.com/ocornut/imgui/releases for more details.
 
+ - 2021/01/26 (1.81) - imgui_freetype: removed ImGuiFreeType::BuildFontAtlas(). Kept inline redirection function. Prefer using '#define IMGUI_ENABLE_FREETYPE', but there's a runtime selection path available too. The shared extra flags parameters (very rarely used) are now stored in ImFontAtlas::FontBuilderFlags.
+                     - imgui_freetype: renamed ImFontConfig::RasterizerFlags (used by FreeType) to ImFontConfig::FontBuilderFlags.
+                     - imgui_freetype: renamed ImGuiFreeType::XXX flags to ImGuiFreeTypeBuilderFlags_XXX for consistency with other API.
  - 2020/10/12 (1.80) - removed redirecting functions/enums that were marked obsolete in 1.63 (August 2018):
                         - ImGui::IsItemDeactivatedAfterChange() -> use ImGui::IsItemDeactivatedAfterEdit().
                         - ImGuiCol_ModalWindowDarkening       -> use ImGuiCol_ModalWindowDimBg
@@ -1130,7 +1133,7 @@ void ImGuiIO::ClearInputCharacters()
 
 ImVec2 ImBezierCubicClosestPoint(const ImVec2& p1, const ImVec2& p2, const ImVec2& p3, const ImVec2& p4, const ImVec2& p, int num_segments)
 {
-    IM_ASSERT(num_segments > 0); // Use ImBezierClosestPointCasteljau()
+    IM_ASSERT(num_segments > 0); // Use ImBezierCubicClosestPointCasteljau()
     ImVec2 p_last = p1;
     ImVec2 p_closest;
     float p_closest_dist2 = FLT_MAX;
@@ -3346,11 +3349,23 @@ void ImGui::DestroyContext(ImGuiContext* ctx)
 }
 
 // No specific ordering/dependency support, will see as needed
-void ImGui::AddContextHook(ImGuiContext* ctx, const ImGuiContextHook* hook)
+ImGuiID ImGui::AddContextHook(ImGuiContext* ctx, const ImGuiContextHook* hook)
 {
     ImGuiContext& g = *ctx;
-    IM_ASSERT(hook->Callback != NULL);
+    IM_ASSERT(hook->Callback != NULL && hook->HookId == 0 && hook->Type != ImGuiContextHookType_PendingRemoval_);
     g.Hooks.push_back(*hook);
+    g.Hooks.back().HookId = ++g.HookIdNext;
+    return g.HookIdNext;
+}
+
+// Deferred removal, avoiding issue with changing vector while iterating it
+void ImGui::RemoveContextHook(ImGuiContext* ctx, ImGuiID hook_id)
+{
+    ImGuiContext& g = *ctx;
+    IM_ASSERT(hook_id != 0);
+    for (int n = 0; n < g.Hooks.Size; n++)
+        if (g.Hooks[n].HookId == hook_id)
+            g.Hooks[n].Type = ImGuiContextHookType_PendingRemoval_;
 }
 
 // Call context hooks (used by e.g. test engine)
@@ -3780,6 +3795,12 @@ void ImGui::NewFrame()
 {
     IM_ASSERT(GImGui != NULL && "No current context. Did you call ImGui::CreateContext() and ImGui::SetCurrentContext() ?");
     ImGuiContext& g = *GImGui;
+    
+    // Remove pending delete hooks before frame start.
+    // This deferred removal avoid issues of removal while iterating the hook vector
+    for (int n = g.Hooks.Size - 1; n >= 0; n--)
+        if (g.Hooks[n].Type == ImGuiContextHookType_PendingRemoval_)
+            g.Hooks.erase(&g.Hooks[n]);
 
     CallContextHooks(&g, ImGuiContextHookType_NewFramePre);
 
@@ -5493,7 +5514,7 @@ void ImGui::RenderWindowTitleBarContents(ImGuiWindow* window, const ImRect& titl
     const ImVec2 text_size = CalcTextSize(name, NULL, true) + ImVec2(marker_size_x, 0.0f);
 
     // As a nice touch we try to ensure that centered title text doesn't get affected by visibility of Close/Collapse button,
-    // while uncentered title text will still reach edges correct.
+    // while uncentered title text will still reach edges correctly.
     if (pad_l > style.FramePadding.x)
         pad_l += g.Style.ItemInnerSpacing.x;
     if (pad_r > style.FramePadding.x)
@@ -5507,8 +5528,9 @@ void ImGui::RenderWindowTitleBarContents(ImGuiWindow* window, const ImRect& titl
     }
 
     ImRect layout_r(title_bar_rect.Min.x + pad_l, title_bar_rect.Min.y, title_bar_rect.Max.x - pad_r, title_bar_rect.Max.y);
-    ImRect clip_r(layout_r.Min.x, layout_r.Min.y, layout_r.Max.x + g.Style.ItemInnerSpacing.x, layout_r.Max.y);
-    //if (g.IO.KeyCtrl) window->DrawList->AddRect(layout_r.Min, layout_r.Max, IM_COL32(255, 128, 0, 255)); // [DEBUG]
+    ImRect clip_r(layout_r.Min.x, layout_r.Min.y, ImMin(layout_r.Max.x + g.Style.ItemInnerSpacing.x, title_bar_rect.Max.x), layout_r.Max.y);
+    //if (g.IO.KeyShift) window->DrawList->AddRect(layout_r.Min, layout_r.Max, IM_COL32(255, 128, 0, 255)); // [DEBUG]
+    //if (g.IO.KeyCtrl) window->DrawList->AddRect(clip_r.Min, clip_r.Max, IM_COL32(255, 128, 0, 255)); // [DEBUG]
     RenderTextClipped(layout_r.Min, layout_r.Max, name, NULL, &text_size, style.WindowTitleAlign, &clip_r);
     if (flags & ImGuiWindowFlags_UnsavedDocument)
     {
@@ -6100,7 +6122,7 @@ bool ImGui::Begin(const char* name, bool* p_open, ImGuiWindowFlags flags)
 
         // Title bar
         if (!(flags & ImGuiWindowFlags_NoTitleBar))
-            RenderWindowTitleBarContents(window, title_bar_rect, name, p_open);
+            RenderWindowTitleBarContents(window, ImRect(title_bar_rect.Min.x + window->WindowBorderSize, title_bar_rect.Min.y, title_bar_rect.Max.x - window->WindowBorderSize, title_bar_rect.Max.y), name, p_open);
 
         // Clear hit test shape every frame
         window->HitTestHoleSize.x = window->HitTestHoleSize.y = 0;
@@ -6406,15 +6428,15 @@ void ImGui::PopButtonRepeat()
 void ImGui::PushTextWrapPos(float wrap_pos_x)
 {
     ImGuiWindow* window = GetCurrentWindow();
+    window->DC.TextWrapPosStack.push_back(window->DC.TextWrapPos);
     window->DC.TextWrapPos = wrap_pos_x;
-    window->DC.TextWrapPosStack.push_back(wrap_pos_x);
 }
 
 void ImGui::PopTextWrapPos()
 {
     ImGuiWindow* window = GetCurrentWindow();
+    window->DC.TextWrapPos = window->DC.TextWrapPosStack.back();
     window->DC.TextWrapPosStack.pop_back();
-    window->DC.TextWrapPos = window->DC.TextWrapPosStack.empty() ? -1.0f : window->DC.TextWrapPosStack.back();
 }
 
 bool ImGui::IsWindowChildOf(ImGuiWindow* window, ImGuiWindow* potential_parent)
@@ -7371,12 +7393,13 @@ void ImGui::SetNextItemWidth(float item_width)
     g.NextItemData.Width = item_width;
 }
 
+// FIXME: Remove the == 0.0f behavior?
 void ImGui::PushItemWidth(float item_width)
 {
     ImGuiContext& g = *GImGui;
     ImGuiWindow* window = g.CurrentWindow;
+    window->DC.ItemWidthStack.push_back(window->DC.ItemWidth); // Backup current width
     window->DC.ItemWidth = (item_width == 0.0f ? window->ItemWidthDefault : item_width);
-    window->DC.ItemWidthStack.push_back(window->DC.ItemWidth);
     g.NextItemData.Flags &= ~ImGuiNextItemDataFlags_HasWidth;
 }
 
@@ -7387,18 +7410,19 @@ void ImGui::PushMultiItemsWidths(int components, float w_full)
     const ImGuiStyle& style = g.Style;
     const float w_item_one  = ImMax(1.0f, IM_FLOOR((w_full - (style.ItemInnerSpacing.x) * (components - 1)) / (float)components));
     const float w_item_last = ImMax(1.0f, IM_FLOOR(w_full - (w_item_one + style.ItemInnerSpacing.x) * (components - 1)));
+    window->DC.ItemWidthStack.push_back(window->DC.ItemWidth); // Backup current width
     window->DC.ItemWidthStack.push_back(w_item_last);
-    for (int i = 0; i < components - 1; i++)
+    for (int i = 0; i < components - 2; i++)
         window->DC.ItemWidthStack.push_back(w_item_one);
-    window->DC.ItemWidth = window->DC.ItemWidthStack.back();
+    window->DC.ItemWidth = (components == 1) ? w_item_last : w_item_one;
     g.NextItemData.Flags &= ~ImGuiNextItemDataFlags_HasWidth;
 }
 
 void ImGui::PopItemWidth()
 {
     ImGuiWindow* window = GetCurrentWindow();
+    window->DC.ItemWidth = window->DC.ItemWidthStack.back();
     window->DC.ItemWidthStack.pop_back();
-    window->DC.ItemWidth = window->DC.ItemWidthStack.empty() ? window->ItemWidthDefault : window->DC.ItemWidthStack.back();
 }
 
 // Calculate default item width given value passed to PushItemWidth() or SetNextItemWidth().
